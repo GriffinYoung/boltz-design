@@ -1233,3 +1233,61 @@ class Boltz1(LightningModule):
 
     def on_test_start(self) -> None:
         self.prepare_eval()
+
+    # In this function, we take in a batch like in training_step
+    # However, we add the feat
+    def optimize_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
+        out = self(
+            feats=batch,
+            recycling_steps=self.predict_args["recycling_steps"],
+            num_sampling_steps=self.predict_args["sampling_steps"],
+            diffusion_samples=1,
+        )
+        
+        # Compute losses
+        ligand_iptm_loss = out['ligand_iptm'].mean()
+
+        # Log losses
+        self.log("design/ligand_iptm_loss", ligand_iptm_loss)
+        loss = ligand_iptm_loss
+
+        self.log("design/loss", loss)
+        # self.design_log()
+        return loss
+
+    def predict_step(self, batch: dict[str, Tensor], batch_idx: int) -> Any:
+        optimizer = self.get_design_optimizer(batch)
+        optimization_steps = 100
+        # Optimization loop
+        for _ in range(optimization_steps):
+            loss = self.design_step(batch, batch_idx)
+            optimizer.zero_grad()
+            self.manual_backward(loss)
+            optimizer.step()
+        out = self(
+            feats=batch,
+            recycling_steps=self.predict_args["recycling_steps"],
+            num_sampling_steps=self.predict_args["sampling_steps"],
+            diffusion_samples=1,
+        )
+        pred_dict = {"optimized_batch": batch.detach(), "optimized_out": out}
+        return pred_dict
+
+    # def design_log(self):
+    #     self.log("design/grad_norm", self.gradient_norm(self), prog_bar=False)
+    #     self.log("design/param_norm", self.parameter_norm(self), prog_bar=False)
+
+    #     lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+    #     self.log("lr", lr, prog_bar=False)
+
+    def get_design_optimizer(self, batch: dict[str, Tensor]):
+        """Configure the optimizer."""
+        keys_to_optimize = ["ref_pos", "ref_charge", "ref_element", "ref_atom_name_chars", "token_bonds"]
+        features_to_optimize = [batch[key] for key in keys_to_optimize]
+        optimizer = torch.optim.Adam(
+            features_to_optimize,
+            betas=(self.training_args.adam_beta_1, self.training_args.adam_beta_2),
+            eps=self.training_args.adam_eps,
+            lr=self.training_args.base_lr,
+        )
+        return optimizer
