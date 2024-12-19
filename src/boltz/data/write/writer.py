@@ -8,6 +8,7 @@ from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import BasePredictionWriter
 import torch
 from torch import Tensor
+from rdkit import Chem
 
 from boltz.data.types import (
     Interface,
@@ -16,6 +17,28 @@ from boltz.data.types import (
 )
 from boltz.data.write.mmcif import to_mmcif
 from boltz.data.write.pdb import to_pdb
+
+def update_designed_features(structure, designed_features, pad_mask):
+    """Update designed features in the structure."""
+    # Update the structure
+    periodic_table = Chem.GetPeriodicTable()
+    relevant_element_matrix = designed_features['ref_element'][pad_mask.bool()]
+    element_nums = relevant_element_matrix.argmax(dim=-1)
+    assert len(element_nums) == len(structure.atoms)
+    for i, atom in enumerate(structure.atoms):
+        old_element = atom["element"]
+        atomic_number = element_nums[i].item()
+        atom["element"] = atomic_number
+        # element_name = periodic_table.GetElementSymbol(atomic_number)
+        # atom["name"] = np.array([ord(c) - 32 if c != chr(0) else 0 for c in element_name], dtype=np.int32)
+        if old_element != atomic_number:
+            print(f"atom {i} changing from {old_element} to {atom['element']}")
+        # The old "name" is a nparray of ints for some reason??? [35, 20, 19,  0] for atomic number 6
+        # Gonna leave it for now, not sure when it's converted to that character representation
+        # Hopefully the pdbwriter uses just the atomic number to decide what atom something
+
+
+    return structure
 
 
 class BoltzWriter(BasePredictionWriter):
@@ -66,6 +89,10 @@ class BoltzWriter(BasePredictionWriter):
         # Get the records
         records: list[Record] = batch["record"]
 
+        # Load designed features into list of dicts
+        designed_keys = ["ref_element"]
+        designed_features = [{key: batch[key][i] for key in designed_keys} for i in range(len(records))]
+
         # Get the predictions
         coords = prediction["coords"]
         coords = coords.unsqueeze(0)
@@ -77,7 +104,7 @@ class BoltzWriter(BasePredictionWriter):
         idx_to_rank = {idx.item(): rank for rank, idx in enumerate(argsort)}
 
         # Iterate over the records
-        for record, coord, pad_mask in zip(records, coords, pad_masks):
+        for record, coord, pad_mask, designed_feature in zip(records, coords, pad_masks, designed_features):
             # Load the structure
             path = self.data_dir / f"{record.id}.npz"
             structure: Structure = Structure.load(path)
@@ -115,6 +142,8 @@ class BoltzWriter(BasePredictionWriter):
                     residues=residues,
                     interfaces=interfaces,
                 )
+
+                new_structure = update_designed_features(new_structure, designed_feature, pad_mask)
 
                 # Update chain info
                 chain_info = []
@@ -201,7 +230,7 @@ class BoltzWriter(BasePredictionWriter):
                         struct_dir
                         / f"plddt_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
-                    np.savez_compressed(path, plddt=plddt.cpu().numpy())
+                    np.savez_compressed(path, plddt=plddt.cpu().detach().numpy())
 
                 # Save pae
                 if "pae" in prediction:
@@ -210,7 +239,7 @@ class BoltzWriter(BasePredictionWriter):
                         struct_dir
                         / f"pae_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
-                    np.savez_compressed(path, pae=pae.cpu().numpy())
+                    np.savez_compressed(path, pae=pae.cpu().detach().numpy())
 
                 # Save pde
                 if "pde" in prediction:
@@ -219,7 +248,7 @@ class BoltzWriter(BasePredictionWriter):
                         struct_dir
                         / f"pde_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
-                    np.savez_compressed(path, pde=pde.cpu().numpy())
+                    np.savez_compressed(path, pde=pde.cpu().detach().numpy())
 
     def on_predict_epoch_end(
         self,

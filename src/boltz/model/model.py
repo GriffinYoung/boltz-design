@@ -1,6 +1,7 @@
 import gc
 import random
 from typing import Any, Dict, Optional
+from rdkit import Chem
 
 import torch
 import torch._dynamo
@@ -73,9 +74,11 @@ class Boltz1(LightningModule):
         min_dist: float = 2.0,
         max_dist: float = 22.0,
         predict_args: Optional[dict[str, Any]] = None,
+        design: bool = False,
     ) -> None:
         super().__init__()
 
+        self.design = False
         self.save_hyperparameters()
 
         self.lddt = nn.ModuleDict()
@@ -266,7 +269,8 @@ class Boltz1(LightningModule):
 
         # Compute input embeddings
         with torch.set_grad_enabled(
-            self.training and self.structure_prediction_training
+            self.design or 
+            (self.training and self.structure_prediction_training)
         ):
             s_inputs = self.input_embedder(feats)
 
@@ -289,7 +293,8 @@ class Boltz1(LightningModule):
             pair_mask = mask[:, :, None] * mask[:, None, :]
 
             for i in range(recycling_steps + 1):
-                with torch.set_grad_enabled(self.training and (i == recycling_steps)):
+                with torch.set_grad_enabled(self.design or 
+                    (self.training and (i == recycling_steps))):
                     # Fixes an issue with unused parameters in autocast
                     if (
                         self.training
@@ -1236,7 +1241,7 @@ class Boltz1(LightningModule):
 
     # In this function, we take in a batch like in training_step
     # However, we add the feat
-    def optimize_step(self, batch: dict[str, Tensor], batch_idx: int) -> Tensor:
+    def design_step(self, batch: dict[str, Tensor]) -> Tensor:
         out = self(
             feats=batch,
             recycling_steps=self.predict_args["recycling_steps"],
@@ -1245,33 +1250,104 @@ class Boltz1(LightningModule):
         )
         
         # Compute losses
-        ligand_iptm_loss = out['ligand_iptm'].mean()
+        ligand_iptm_loss = out['ligand_iptm'].mean() * -1
 
         # Log losses
-        self.log("design/ligand_iptm_loss", ligand_iptm_loss)
+        print(f"ligand_iptm_loss: {ligand_iptm_loss}")
+        # self.log("design/ligand_iptm_loss", ligand_iptm_loss)
         loss = ligand_iptm_loss
 
-        self.log("design/loss", loss)
+        # self.log("design/loss", loss)
         # self.design_log()
         return loss
 
-    def predict_step(self, batch: dict[str, Tensor], batch_idx: int) -> Any:
-        optimizer = self.get_design_optimizer(batch)
-        optimization_steps = 100
-        # Optimization loop
-        for _ in range(optimization_steps):
-            loss = self.design_step(batch, batch_idx)
-            optimizer.zero_grad()
-            self.manual_backward(loss)
-            optimizer.step()
-        out = self(
-            feats=batch,
-            recycling_steps=self.predict_args["recycling_steps"],
-            num_sampling_steps=self.predict_args["sampling_steps"],
-            diffusion_samples=1,
+    def hard_max(self, x: Tensor, dim: int) -> Tensor:
+        """Hardmax function."""
+        num_classes = x.shape[dim]
+        return torch.nn.functional.one_hot(x.argmax(dim=dim), num_classes=num_classes)
+
+    def discretize_key(self, key: str, value: Tensor) -> Tensor:
+        if key == "ref_element":
+            return self.hard_max(value, dim=-1)
+        else:
+            raise NotImplementedError(f"Discretization of key {key} not implemented")
+
+    def discretize_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        keys_to_optimize = ["ref_element"]
+        for key in keys_to_optimize:
+            batch[key] = self.discretize_key(key, batch[key])
+
+    def get_is_ligand(self, batch: dict[str, Tensor]) -> Tensor:
+        atom_type = (
+            torch.bmm(
+                batch["atom_to_token"].float(), batch["mol_type"].unsqueeze(-1).float()
+            )
+            .squeeze(-1)
+            .long()
         )
-        pred_dict = {"optimized_batch": batch.detach(), "optimized_out": out}
-        return pred_dict
+        return atom_type == 3
+
+    def modify_gradients(self, batch: dict[str, Tensor]) -> None:
+        # Only keep gradients for the ligand atoms
+        is_ligand = self.get_is_ligand(batch)
+        batch["ref_element"].grad *= is_ligand[:,:,None]
+
+        # Zero out gradients for non-druglike atoms
+        pt = Chem.GetPeriodicTable()
+        druglike_mask = torch.zeros_like(batch["ref_element"])
+        druglike_element_symbols = ["C", "N", "O", "S", "F", "Cl", "Br", "I"]
+        for symbol in druglike_element_symbols:
+            index = pt.GetAtomicNumber(symbol)
+            druglike_mask[:, :, index] = 1
+        batch["ref_element"].grad *= druglike_mask
+
+    def design_batch(self, batch: dict[str, Tensor]) -> None:
+        torch.set_grad_enabled(True)
+        self.design = True
+        og_ref_element = batch["ref_element"].clone()
+        best_ref_element = og_ref_element.clone()
+        best_loss = float("inf")
+        optimizer = self.get_design_optimizer(batch)
+        optimization_steps = 300
+        # Optimization loop
+        for i in range(optimization_steps):
+            print(f"Optimization step {i}")
+            optimizer.zero_grad()
+            loss = self.design_step(batch)
+            if loss < best_loss:
+                best_loss = loss
+                best_ref_element = batch["ref_element"].clone()
+            self.manual_backward(loss)
+            self.modify_gradients(batch)
+
+            optimizer.step()
+            gradient_norm = torch.tensor([p.grad.norm(p=2) ** 2 for p in optimizer.param_groups[0]["params"]]).sum().sqrt()
+            print(f"Scale of gradient: {gradient_norm}")
+            update_norm = (batch['ref_element'] - og_ref_element).norm(p=2)
+            print(f"Scaled of update: {update_norm}")
+            # Get the ref_element of just the ligand atoms
+            lig_ref_element = batch["ref_element"][self.get_is_ligand(batch)]
+            # print argmax of each and its corresponding value
+            obj = lig_ref_element.max(dim=-1)
+            readout = ""
+            for i in range(obj.values.shape[0]):
+                readout += f"{obj.indices[i]}({obj.values[i]:.2f}) "
+            print(readout)
+
+            # Stop if converged
+            if gradient_norm < 1e-3:
+                break
+
+        # Set the best ref_element
+        batch["ref_element"] = best_ref_element
+
+        self.discretize_batch(batch)
+        # turn off gradients for the batch
+        for p in optimizer.param_groups[0]["params"]:
+            p.requires_grad = False
+        
+        self.design = False
+        torch.set_grad_enabled(False)
 
     # def design_log(self):
     #     self.log("design/grad_norm", self.gradient_norm(self), prog_bar=False)
@@ -1282,12 +1358,16 @@ class Boltz1(LightningModule):
 
     def get_design_optimizer(self, batch: dict[str, Tensor]):
         """Configure the optimizer."""
-        keys_to_optimize = ["ref_pos", "ref_charge", "ref_element", "ref_atom_name_chars", "token_bonds"]
+        keys_to_optimize = ["ref_element"] #["ref_pos", "ref_charge", "ref_element", "ref_atom_name_chars", "token_bonds"]
+        for key in keys_to_optimize:
+            with torch.inference_mode(mode=False):
+                batch[key] = batch[key].float().clone()
+            batch[key].requires_grad = True
         features_to_optimize = [batch[key] for key in keys_to_optimize]
         optimizer = torch.optim.Adam(
             features_to_optimize,
             betas=(self.training_args.adam_beta_1, self.training_args.adam_beta_2),
             eps=self.training_args.adam_eps,
-            lr=self.training_args.base_lr,
+            lr=1e-2,
         )
         return optimizer

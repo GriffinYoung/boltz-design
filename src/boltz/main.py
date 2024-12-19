@@ -9,6 +9,7 @@ import torch
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_only
+from pytorch_lightning.callbacks import Callback
 from tqdm import tqdm
 
 from boltz.data import const
@@ -22,11 +23,16 @@ from boltz.data.types import MSA, Manifest, Record
 from boltz.data.write.writer import BoltzWriter
 from boltz.model.model import Boltz1
 
+
 CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
 MODEL_URL = (
     "https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1_conf.ckpt"
 )
 
+class LigandDesigner(Callback):
+    def on_predict_batch_start(self, trainer, pl_module, batch, batch_idx):
+        pl_module.design_batch(batch)
+        batch['designd'] = True
 
 @dataclass
 class BoltzProcessedInput:
@@ -496,6 +502,11 @@ def cli() -> None:
     help="Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete'",
     default="greedy",
 )
+@click.option(
+    "--design_ligand",
+    is_flag=True,
+    help="Whether to design ligand composition. Default is False.",
+)
 def predict(
     data: str,
     out_dir: str,
@@ -516,6 +527,7 @@ def predict(
     use_msa_server: bool = False,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
+    design_ligand: bool = False,
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
@@ -524,7 +536,7 @@ def predict(
         click.echo(msg)
 
     # Set no grad
-    torch.set_grad_enabled(False)
+    torch.set_grad_enabled(not design_ligand)
 
     # Ignore matmul precision warning
     torch.set_float32_matmul_precision("highest")
@@ -617,6 +629,7 @@ def predict(
         map_location="cpu",
         diffusion_process_args=asdict(diffusion_params),
         ema=False,
+        design=design_ligand,
     )
     model_module.eval()
 
@@ -627,13 +640,20 @@ def predict(
         output_format=output_format,
     )
 
+    callbacks = [pred_writer]
+    if design_ligand:
+        model_module.automatic_optimization = False
+        ligand_designer = LigandDesigner()
+        callbacks.append(ligand_designer)
+
     trainer = Trainer(
         default_root_dir=out_dir,
         strategy=strategy,
-        callbacks=[pred_writer],
+        callbacks=callbacks,
         accelerator=accelerator,
         devices=devices,
         precision=32,
+        inference_mode=(not design_ligand),
     )
 
     # Compute predictions
