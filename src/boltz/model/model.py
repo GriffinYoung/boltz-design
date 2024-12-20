@@ -1241,7 +1241,8 @@ class Boltz1(LightningModule):
 
     # In this function, we take in a batch like in training_step
     # However, we add the feat
-    def design_step(self, batch: dict[str, Tensor]) -> Tensor:
+    def design_step(self, batch: dict[str, Tensor], anneal) -> Tensor:
+        features_to_design = ["ref_element"]
         out = self(
             feats=batch,
             recycling_steps=self.predict_args["recycling_steps"],
@@ -1250,12 +1251,20 @@ class Boltz1(LightningModule):
         )
         
         # Compute losses
-        ligand_iptm_loss = out['ligand_iptm'].mean() * -1
+        confidence_score_loss = -1 * (
+                    4 * out["complex_plddt"] +
+                    (out["iptm"] if not torch.allclose(out["iptm"], torch.zeros_like(out["iptm"])) else out["ptm"])
+                ) / 5
+
+        # Penalty for not being close to discrete values
+        atom_confidences = torch.nn.Softmax(dim=-1)(batch["ref_element"]).max(dim=-1).values.sum()
+        ref_element_anneal_loss = -1 * anneal * atom_confidences
 
         # Log losses
-        print(f"ligand_iptm_loss: {ligand_iptm_loss}")
-        # self.log("design/ligand_iptm_loss", ligand_iptm_loss)
-        loss = ligand_iptm_loss
+        print(f"confidence: {confidence_score_loss * -1}")
+        print(f"Atom confidences: {atom_confidences}")
+        # self.log("design/confidence_score_loss", confidence_score_loss)
+        loss = confidence_score_loss + ref_element_anneal_loss
 
         # self.log("design/loss", loss)
         # self.design_log()
@@ -1277,29 +1286,79 @@ class Boltz1(LightningModule):
         for key in keys_to_optimize:
             batch[key] = self.discretize_key(key, batch[key])
 
-    def get_is_ligand(self, batch: dict[str, Tensor]) -> Tensor:
-        atom_type = (
+    def get_token_is_ligand(self, batch: dict[str, Tensor]) -> Tensor:
+        return (batch["mol_type"] == 3).squeeze(-1)
+
+    def get_ligand_token_bonds(self, batch: dict[str, Tensor]) -> Tensor:
+        token_is_ligand = self.get_token_is_ligand(batch)
+        return batch["token_bonds"][token_is_ligand]
+
+    def convert_token_to_atom_features(self, batch: dict[str, Tensor], token_features: str) -> Tensor: 
+        atom_features = (
             torch.bmm(
-                batch["atom_to_token"].float(), batch["mol_type"].unsqueeze(-1).float()
+                batch["atom_to_token"].float(), token_features.unsqueeze(-1).float()
             )
             .squeeze(-1)
             .long()
         )
-        return atom_type == 3
+        return atom_features
+
+    def atom_is_ligand(self, batch: dict[str, Tensor]) -> Tensor:
+        token_is_ligand = (batch['mol_type'] == 3)
+        return self.convert_token_to_atom_features(batch, token_is_ligand)
 
     def modify_gradients(self, batch: dict[str, Tensor]) -> None:
         # Only keep gradients for the ligand atoms
-        is_ligand = self.get_is_ligand(batch)
+        is_ligand = self.atom_is_ligand(batch)
         batch["ref_element"].grad *= is_ligand[:,:,None]
+        batch["ref_element"].grad *= self.get_atom_substitution_mask(batch)
 
-        # Zero out gradients for non-druglike atoms
+    def get_degree_to_substitution_vector_dict(self) -> dict[int, list[str]]:
+        # Construct a dict mapping from bond degree to a vector containing
+        # ones in all the atoms you can validly substitute for that degree
+        # This will contain all the atoms with that allowed bond degree
+        # or more. For example, an atom with bond degree 2 can be substituted
+        # with an atom with bond degree 2, 3, or 4.
+
+        # First, construct a mapping from bond degree to a vector with ones 
+        # in all the atoms with that number of missing electrons
         pt = Chem.GetPeriodicTable()
-        druglike_mask = torch.zeros_like(batch["ref_element"])
-        druglike_element_symbols = ["C", "N", "O", "S", "F", "Cl", "Br", "I"]
-        for symbol in druglike_element_symbols:
-            index = pt.GetAtomicNumber(symbol)
-            druglike_mask[:, :, index] = 1
-        batch["ref_element"].grad *= druglike_mask
+        missing_electron_element_dict = {
+            0:[], 
+            1:["F", "Cl", "Br", "I"],
+            2:["O", "S"],
+            3:["N"],
+            4:["C"],
+        }
+        missing_electron_vector_dict = {}
+        for degree, elements in missing_electron_element_dict.items():
+            vector = torch.zeros(128, device=self.device)
+            for element in elements:
+                index = pt.GetAtomicNumber(element)
+                vector[index] = 1
+            missing_electron_vector_dict[degree] = vector
+        
+        # Next, construct a mapping from bond degree to a vector with ones
+        # in all the atoms with that number of missing electrons or more
+        degree_to_substitution_vector_dict = {}
+        for degree in range(5):
+            vector = torch.zeros(128, device=self.device)
+            for missing_electrons, element_vector in missing_electron_vector_dict.items():
+                if missing_electrons >= degree:
+                    vector += element_vector
+            degree_to_substitution_vector_dict[degree] = vector
+        return degree_to_substitution_vector_dict
+
+    def get_atom_substitution_mask(self, batch: dict[str, Tensor]) -> Tensor:
+        token_bond_degree = batch['token_bonds'].sum(dim=2).squeeze(-1)
+        atom_bond_degrees = self.convert_token_to_atom_features(batch, token_bond_degree).squeeze(0)
+        degree_to_substitution_vector_dict = self.get_degree_to_substitution_vector_dict()
+        valid_atom_substitution_vectors = []
+        for atom_bond_degree in atom_bond_degrees:
+            valid_atom_substitution_vectors.append(degree_to_substitution_vector_dict[atom_bond_degree.item()])
+
+        valid_atom_substitution_vectors = torch.stack(valid_atom_substitution_vectors)
+        return valid_atom_substitution_vectors
 
     def design_batch(self, batch: dict[str, Tensor]) -> None:
         torch.set_grad_enabled(True)
@@ -1308,12 +1367,17 @@ class Boltz1(LightningModule):
         best_ref_element = og_ref_element.clone()
         best_loss = float("inf")
         optimizer = self.get_design_optimizer(batch)
-        optimization_steps = 300
+        optimization_steps = 1000
         # Optimization loop
         for i in range(optimization_steps):
             print(f"Optimization step {i}")
             optimizer.zero_grad()
-            loss = self.design_step(batch)
+            if optimization_steps - i < 20:
+                anneal = 1
+            else:
+                anneal = 0
+
+            loss = self.design_step(batch, anneal=anneal)
             if loss < best_loss:
                 best_loss = loss
                 best_ref_element = batch["ref_element"].clone()
@@ -1325,21 +1389,23 @@ class Boltz1(LightningModule):
             print(f"Scale of gradient: {gradient_norm}")
             update_norm = (batch['ref_element'] - og_ref_element).norm(p=2)
             print(f"Scaled of update: {update_norm}")
-            # Get the ref_element of just the ligand atoms
-            lig_ref_element = batch["ref_element"][self.get_is_ligand(batch)]
-            # print argmax of each and its corresponding value
-            obj = lig_ref_element.max(dim=-1)
-            readout = ""
-            for i in range(obj.values.shape[0]):
-                readout += f"{obj.indices[i]}({obj.values[i]:.2f}) "
-            print(readout)
+            # # Get the ref_element of just the ligand atoms
+            # lig_ref_element = batch["ref_element"][self.atom_is_ligand(batch)]
+            # # print argmax of each and its corresponding value
+            # atom_confidences = torch.nn.Softmax(dim=-1)(lig_ref_element)
+            # obj = lig_ref_element.max(dim=-1)
+            # readout = ""
+            # for i in range(obj.values.shape[0]):
+            #     readout += f"{obj.indices[i]}({obj.values[i]:.2f}) "
+            # print(readout)
 
             # Stop if converged
-            if gradient_norm < 1e-3:
+            if gradient_norm < 1e-4:
+                print("Converged")
                 break
 
         # Set the best ref_element
-        batch["ref_element"] = best_ref_element
+        # batch["ref_element"] = best_ref_element
 
         self.discretize_batch(batch)
         # turn off gradients for the batch
